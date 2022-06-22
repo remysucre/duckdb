@@ -79,6 +79,7 @@ public:
 
 	void Run(BenchmarkState *state_p) override {
 		auto state = (DuckDBBenchmarkState *)state_p;
+		state->conn.Query("PRAGMA enable_profiling");
 		string query = GetQuery();
 		if (query.empty()) {
 			RunBenchmark(state);
