@@ -79,7 +79,12 @@ public:
 
 	void Run(BenchmarkState *state_p) override {
 		auto state = (DuckDBBenchmarkState *)state_p;
-		state->conn.Query("PRAGMA enable_profiling");
+		// This pragma prints the plan in JSON
+		state->conn.Query("PRAGMA enable_profiling=json");
+		// This pragma prints the plan in human readable form
+		// state->conn.Query("PRAGMA enable_profiling");
+		// This pragma saves the plan in a json file
+		// state->conn.Query("PRAGMA profiling_output='./profile.json';");
 		string query = GetQuery();
 		if (query.empty()) {
 			RunBenchmark(state);
