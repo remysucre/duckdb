@@ -84,7 +84,7 @@ public:
 		// This pragma prints the plan in human readable form
 		// state->conn.Query("PRAGMA enable_profiling");
 		// This pragma saves the plan in a json file
-		// state->conn.Query("PRAGMA profiling_output='./profile.json';");
+		state->conn.Query("PRAGMA profiling_output='./profile.json';");
 		string query = GetQuery();
 		if (query.empty()) {
 			RunBenchmark(state);
