@@ -39,7 +39,8 @@ const string &ColumnRefExpression::GetTableName() const {
 }
 
 string ColumnRefExpression::GetName() const {
-	return !alias.empty() ? alias : column_names.back();
+	// return !alias.empty() ? alias : column_names.back();
+	return ToString();
 }
 
 string ColumnRefExpression::ToString() const {
