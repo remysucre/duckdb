@@ -527,7 +527,7 @@ string QueryProfiler::ToJSON() const {
 	ss << "   \"cardinality\": " + to_string(root->info.elements) + ",\n";
 	// JSON cannot have literal control characters in string literals
 	string extra_info = JSONSanitize(query);
-	ss << "   \"extra-info\": \"" + extra_info + "\", \n";
+	ss << "   \"extra_info\": \"" + extra_info + "\", \n";
 	// print the phase timings
 	ss << "   \"timings\": [\n";
 	const auto &ordered_phase_timings = GetOrderedPhaseTimings();
