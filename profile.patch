@@ -1,0 +1,15 @@
+diff --git a/src/parser/expression/columnref_expression.cpp b/src/parser/expression/columnref_expression.cpp
+index 6fb19a5d7..f6f5c1ce2 100644
+--- a/src/parser/expression/columnref_expression.cpp
++++ b/src/parser/expression/columnref_expression.cpp
+@@ -39,8 +39,8 @@ const string &ColumnRefExpression::GetTableName() const {
+ }
+ 
+ string ColumnRefExpression::GetName() const {
+-	return !alias.empty() ? alias : column_names.back();
+-	// return ToString();
++	// return !alias.empty() ? alias : column_names.back();
++	return ToString();
+ }
+ 
+ string ColumnRefExpression::ToString() const {
