@@ -50,6 +50,7 @@ string ColumnRefExpression::ToString() const {
 			result += ".";
 		}
 		result += KeywordHelper::WriteOptionallyQuoted(column_names[i]);
+		// result += column_names[i];
 	}
 	return result;
 }
