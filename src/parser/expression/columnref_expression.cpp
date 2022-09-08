@@ -39,8 +39,11 @@ const string &ColumnRefExpression::GetTableName() const {
 }
 
 string ColumnRefExpression::GetName() const {
-	return !alias.empty() ? alias : column_names.back();
-	// return ToString();
+	if (std::getenv("GJ_TABLE")) {
+		return ToString();
+	} else {
+		return !alias.empty() ? alias : column_names.back();
+	}
 }
 
 string ColumnRefExpression::ToString() const {
@@ -49,8 +52,11 @@ string ColumnRefExpression::ToString() const {
 		if (i > 0) {
 			result += ".";
 		}
-		result += KeywordHelper::WriteOptionallyQuoted(column_names[i]);
-		// result += column_names[i];
+		if (std::getenv("GJ_TABLE")) {
+			result += column_names[i];
+		} else {
+			result += KeywordHelper::WriteOptionallyQuoted(column_names[i]);
+		}
 	}
 	return result;
 }
