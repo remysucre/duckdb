@@ -756,7 +756,8 @@ unique_ptr<LogicalOperator> JoinOrderOptimizer::Optimize(unique_ptr<LogicalOpera
 	for (idx_t i = 0; i < relations.size(); i++) {
 		auto &rel = *relations[i];
 		auto node = set_manager.GetJoinRelation(i);
-		plans[node] = make_unique<JoinNode>(node, rel.op->EstimateCardinality(context));
+		// plans[node] = make_unique<JoinNode>(node, rel.op->EstimateCardinality(context));
+		plans[node] = make_unique<JoinNode>(node, 1);
 	}
 	// now we perform the actual dynamic programming to compute the final result
 	SolveJoinOrder();
