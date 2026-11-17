@@ -30,6 +30,8 @@
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include <thread>
+#include <chrono>
+#include <cstdlib>
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
@@ -437,6 +439,228 @@ static bool ShouldBuildBloomFilterInSink(ClientContext &context, const PhysicalH
 	return JoinIsLikelyExternal(context, op);
 }
 
+//! Experiment: how often do join key streams arrive in sorted order? (DUCKDB_HSJ_ORDER_STATS=1)
+struct JoinOrderStats {
+	atomic<idx_t> rows {0};
+	atomic<idx_t> pairs {0};
+	atomic<idx_t> nondecreasing {0};
+	atomic<idx_t> equal {0};
+	atomic<idx_t> chunks {0};
+	atomic<idx_t> sorted_chunks {0};
+};
+
+static bool JoinOrderStatsEnabled() {
+	static const bool enabled = [] {
+		const auto value = std::getenv("DUCKDB_HSJ_ORDER_STATS");
+		return value && *value && value[0] != '0';
+	}();
+	return enabled;
+}
+
+//! Experiment: build vs probe phase times per join (DUCKDB_HSJ_PHASE_TIMING=1)
+struct JoinPhaseTimes {
+	atomic<int64_t> sink_cpu_ns {0};
+	atomic<int64_t> finalize_cpu_ns {0};
+	atomic<int64_t> probe_cpu_ns {0};
+	atomic<int64_t> first_sink_ns {NumericLimits<int64_t>::Maximum()};
+	atomic<int64_t> finalize_start_ns {0};
+	atomic<int64_t> finalize_end_ns {0};
+	atomic<int64_t> first_probe_ns {NumericLimits<int64_t>::Maximum()};
+	atomic<int64_t> last_probe_ns {0};
+	atomic<idx_t> build_rows {0};
+	atomic<idx_t> probe_rows {0};
+};
+
+static bool JoinPhaseTimingEnabled() {
+	static const bool enabled = [] {
+		const auto value = std::getenv("DUCKDB_HSJ_PHASE_TIMING");
+		return value && *value && value[0] != '0';
+	}();
+	return enabled;
+}
+
+static int64_t PhaseNowNs() {
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+}
+
+static void AtomicMinNs(atomic<int64_t> &target, int64_t value) {
+	auto current = target.load();
+	while (value < current && !target.compare_exchange_weak(current, value)) {
+	}
+}
+
+static void AtomicMaxNs(atomic<int64_t> &target, int64_t value) {
+	auto current = target.load();
+	while (value > current && !target.compare_exchange_weak(current, value)) {
+	}
+}
+
+//! Finalize work nests (Finalize -> ExecuteDirectly -> FinishHashJoinBuild), so only the outermost scope counts
+struct JoinFinalizeCpuScope {
+	explicit JoinFinalizeCpuScope(JoinPhaseTimes &times) : times(times), active(JoinPhaseTimingEnabled()) {
+		if (active) {
+			active = Depth()++ == 0;
+			start = PhaseNowNs();
+		}
+	}
+	~JoinFinalizeCpuScope() {
+		if (JoinPhaseTimingEnabled()) {
+			Depth()--;
+		}
+		if (active) {
+			times.finalize_cpu_ns += PhaseNowNs() - start;
+		}
+	}
+	static int &Depth() {
+		static thread_local int depth = 0;
+		return depth;
+	}
+	JoinPhaseTimes &times;
+	bool active;
+	int64_t start = 0;
+};
+
+//! Accumulates the scope's wall time into a cpu-sum counter and widens the phase's first/last markers
+struct JoinPhaseScope {
+	JoinPhaseScope(JoinPhaseTimes &times, atomic<int64_t> &acc, atomic<int64_t> &first, atomic<int64_t> &last)
+	    : acc(acc), first(first), last(last), start(PhaseNowNs()) {
+		AtomicMinNs(first, start);
+	}
+	~JoinPhaseScope() {
+		const auto end = PhaseNowNs();
+		acc += end - start;
+		AtomicMaxNs(last, end);
+	}
+	atomic<int64_t> &acc;
+	atomic<int64_t> &first;
+	atomic<int64_t> &last;
+	int64_t start;
+};
+
+template <class T>
+static void AccumulateJoinOrderStatsTyped(Vector &key, idx_t count, JoinOrderStats &stats) {
+	auto values = key.Values<T>();
+	idx_t pairs = 0, nondecreasing = 0, equal = 0;
+	bool have_prev = false;
+	T prev = T();
+	for (idx_t i = 0; i < count; i++) {
+		const auto &entry = values[i];
+		if (!entry.IsValid()) {
+			continue;
+		}
+		const auto v = entry.GetValue();
+		if (have_prev) {
+			pairs++;
+			nondecreasing += v >= prev;
+			equal += v == prev;
+		}
+		prev = v;
+		have_prev = true;
+	}
+	stats.rows += count;
+	stats.pairs += pairs;
+	stats.nondecreasing += nondecreasing;
+	stats.equal += equal;
+	stats.chunks += 1;
+	stats.sorted_chunks += pairs > 0 && nondecreasing == pairs;
+}
+
+static void AccumulateJoinOrderStats(Vector &key, idx_t count, JoinOrderStats &stats) {
+	switch (key.GetType().InternalType()) {
+	case PhysicalType::INT8:
+		return AccumulateJoinOrderStatsTyped<int8_t>(key, count, stats);
+	case PhysicalType::INT16:
+		return AccumulateJoinOrderStatsTyped<int16_t>(key, count, stats);
+	case PhysicalType::INT32:
+		return AccumulateJoinOrderStatsTyped<int32_t>(key, count, stats);
+	case PhysicalType::INT64:
+		return AccumulateJoinOrderStatsTyped<int64_t>(key, count, stats);
+	case PhysicalType::UINT8:
+		return AccumulateJoinOrderStatsTyped<uint8_t>(key, count, stats);
+	case PhysicalType::UINT16:
+		return AccumulateJoinOrderStatsTyped<uint16_t>(key, count, stats);
+	case PhysicalType::UINT32:
+		return AccumulateJoinOrderStatsTyped<uint32_t>(key, count, stats);
+	case PhysicalType::UINT64:
+		return AccumulateJoinOrderStatsTyped<uint64_t>(key, count, stats);
+	default:
+		return;
+	}
+}
+
+//! Registry of every join's statistics, dumped at process exit (sink states may outlive the shell's last query)
+struct JoinOrderStatsEntry {
+	string condition;
+	shared_ptr<JoinOrderStats> build;
+	shared_ptr<JoinOrderStats> probe;
+	shared_ptr<JoinPhaseTimes> phase;
+};
+
+static void PrintJoinPhaseTimes(const string &condition, const JoinPhaseTimes &t) {
+	if (t.build_rows == 0 && t.probe_rows == 0) {
+		return;
+	}
+	const double ms = 1e-6;
+	const auto build_wall = t.finalize_end_ns.load() - t.first_sink_ns.load();
+	const auto finalize_wall = t.finalize_end_ns.load() - t.finalize_start_ns.load();
+	const auto probe_wall = t.last_probe_ns.load() - t.first_probe_ns.load();
+	fprintf(stderr,
+	        "[join-phase] %s | build_rows=%llu probe_rows=%llu | sink_cpu_ms=%.3f finalize_cpu_ms=%.3f "
+	        "finalize_wall_ms=%.3f build_wall_ms=%.3f | probe_cpu_ms=%.3f probe_wall_ms=%.3f\n",
+	        condition.c_str(), (unsigned long long)t.build_rows.load(), (unsigned long long)t.probe_rows.load(),
+	        (double)t.sink_cpu_ns.load() * ms, (double)t.finalize_cpu_ns.load() * ms,
+	        t.finalize_end_ns ? (double)finalize_wall * ms : 0.0,
+	        t.finalize_end_ns ? (double)build_wall * ms : 0.0, (double)t.probe_cpu_ns.load() * ms,
+	        t.last_probe_ns ? (double)probe_wall * ms : 0.0);
+}
+
+static void PrintJoinOrderStats(const char *side, const JoinOrderStats &st);
+
+static mutex &JoinOrderRegistryLock() {
+	static mutex lock;
+	return lock;
+}
+
+static vector<JoinOrderStatsEntry> &JoinOrderRegistry() {
+	static vector<JoinOrderStatsEntry> registry;
+	return registry;
+}
+
+static void DumpJoinOrderRegistry() {
+	lock_guard<mutex> guard(JoinOrderRegistryLock());
+	for (auto &entry : JoinOrderRegistry()) {
+		if (JoinPhaseTimingEnabled()) {
+			PrintJoinPhaseTimes(entry.condition, *entry.phase);
+		}
+		if (entry.build->rows == 0 && entry.probe->rows == 0) {
+			continue;
+		}
+		fprintf(stderr, "[join-order] %s\n", entry.condition.c_str());
+		PrintJoinOrderStats("build", *entry.build);
+		PrintJoinOrderStats("probe", *entry.probe);
+	}
+}
+
+static void RegisterJoinOrderStats(const string &condition, shared_ptr<JoinOrderStats> build,
+                                   shared_ptr<JoinOrderStats> probe, shared_ptr<JoinPhaseTimes> phase) {
+	lock_guard<mutex> guard(JoinOrderRegistryLock());
+	auto &registry = JoinOrderRegistry();
+	if (registry.empty()) {
+		std::atexit(DumpJoinOrderRegistry);
+	}
+	registry.push_back({condition, std::move(build), std::move(probe), std::move(phase)});
+}
+
+static void PrintJoinOrderStats(const char *side, const JoinOrderStats &st) {
+	const auto pairs = st.pairs.load();
+	fprintf(stderr, "  %s rows=%llu chunks=%llu sorted_chunks=%.3f nondecreasing_pairs=%.3f equal_pairs=%.3f\n",
+	        side, (unsigned long long)st.rows.load(), (unsigned long long)st.chunks.load(),
+	        st.chunks ? (double)st.sorted_chunks.load() / (double)st.chunks.load() : 0.0,
+	        pairs ? (double)st.nondecreasing.load() / (double)pairs : 0.0,
+	        pairs ? (double)st.equal.load() / (double)pairs : 0.0);
+}
+
 class HashJoinGlobalSinkState : public GlobalSinkState {
 public:
 	HashJoinGlobalSinkState(const PhysicalHashJoin &op_p, ClientContext &context_p)
@@ -444,6 +668,14 @@ public:
 	      temporary_memory_state(TemporaryMemoryManager::Get(context.Services()).Register(context.Services())),
 	      initial_radix_bits(4), finalized(false), active_local_states(0), total_size(0), max_partition_size(0),
 	      max_partition_count(0), probe_side_requirement(0), scanned_data(false) {
+		if ((JoinOrderStatsEnabled() && op.conditions.size() == 1) || JoinPhaseTimingEnabled()) {
+			string condition;
+			for (auto &cond : op.conditions) {
+				condition += (condition.empty() ? "" : " AND ") + cond.GetLHS().ToString() + " = " +
+				             cond.GetRHS().ToString();
+			}
+			RegisterJoinOrderStats(condition, build_order_stats_ptr, probe_order_stats_ptr, phase_times_ptr);
+		}
 		hash_table = op.InitializeHashTable(context, initial_radix_bits);
 		// Reserve the initial partition buffers before upstream hash tables are finalized.
 		auto minimum_reservation = MinValue(temporary_memory_state->GetMinimumReservation(),
@@ -510,6 +742,13 @@ public:
 		DUCKDB_LOG(context, PhysicalOperatorLogType, op, "PhysicalHashJoin", "GetData",
 		           {{"total_probe_matches", to_string(hash_table->total_probe_matches)}});
 	}
+
+	shared_ptr<JoinOrderStats> build_order_stats_ptr = make_shared_ptr<JoinOrderStats>();
+	shared_ptr<JoinOrderStats> probe_order_stats_ptr = make_shared_ptr<JoinOrderStats>();
+	JoinOrderStats &build_order_stats = *build_order_stats_ptr;
+	JoinOrderStats &probe_order_stats = *probe_order_stats_ptr;
+	shared_ptr<JoinPhaseTimes> phase_times_ptr = make_shared_ptr<JoinPhaseTimes>();
+	JoinPhaseTimes &phase_times = *phase_times_ptr;
 
 	void ScheduleFinalize(Pipeline &pipeline, Event &event);
 	void InitializeProbeSpill();
@@ -904,10 +1143,18 @@ void JoinFilterPushdownInfo::Sink(DataChunk &chunk, JoinFilterLocalState &lstate
 SinkResultType PhysicalHashJoin::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
 	auto &gstate = input.global_state.Cast<HashJoinGlobalSinkState>();
 	auto &lstate = input.local_state.Cast<HashJoinLocalSinkState>();
+	unique_ptr<JoinPhaseScope> phase_scope;
+	if (JoinPhaseTimingEnabled()) {
+		auto &t = gstate.phase_times;
+		phase_scope = make_uniq<JoinPhaseScope>(t, t.sink_cpu_ns, t.first_sink_ns, t.finalize_start_ns);
+	}
 
 	// resolve the join keys for the right chunk
 	lstate.join_keys.Reset();
 	lstate.join_key_executor.Execute(chunk, lstate.join_keys);
+	if (JoinOrderStatsEnabled() && conditions.size() == 1) {
+		AccumulateJoinOrderStats(lstate.join_keys.data[0], lstate.join_keys.size(), gstate.build_order_stats);
+	}
 
 	if (filter_pushdown && !gstate.skip_filter_pushdown) {
 		filter_pushdown->Sink(lstate.join_keys, *lstate.local_filter_state);
@@ -942,6 +1189,11 @@ void JoinFilterPushdownInfo::Combine(JoinFilterGlobalState &gstate, JoinFilterLo
 SinkCombineResultType PhysicalHashJoin::Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const {
 	auto &gstate = input.global_state.Cast<HashJoinGlobalSinkState>();
 	auto &lstate = input.local_state.Cast<HashJoinLocalSinkState>();
+	unique_ptr<JoinPhaseScope> phase_scope;
+	if (JoinPhaseTimingEnabled()) {
+		auto &t = gstate.phase_times;
+		phase_scope = make_uniq<JoinPhaseScope>(t, t.sink_cpu_ns, t.first_sink_ns, t.finalize_start_ns);
+	}
 
 	// Under deferred layout, a thread that never received a Sink chunk has no sink_collection to flush
 	const bool has_layout = lstate.append_state_initialised;
@@ -1174,6 +1426,7 @@ public:
 	}
 
 	TaskExecutionResult ExecuteTask(TaskExecutionMode mode) override {
+		JoinFinalizeCpuScope cpu_scope(sink.phase_times);
 		const auto start = queue.StartShard();
 		idx_t pass = 0;
 		JoinBuildRange range;
@@ -1251,6 +1504,7 @@ public:
 	}
 
 	TaskExecutionResult ExecuteTask(TaskExecutionMode mode) override {
+		JoinFinalizeCpuScope cpu_scope(sink.phase_times);
 		const auto start = queue.StartShard();
 		idx_t pass = 0;
 		JoinBuildRange range;
@@ -1272,6 +1526,210 @@ private:
 	JoinBuildQueue &queue;
 };
 
+//===--------------------------------------------------------------------===//
+// Hashed-sorting build events (scatter by coarse bucket, then sort each bucket)
+//===--------------------------------------------------------------------===//
+static bool HashedSortTimingEnabled() {
+	const auto value = std::getenv("DUCKDB_HSJ_TIMING");
+	return value && *value && value[0] != '0';
+}
+
+struct HashedSortTimer {
+	using clock = std::chrono::steady_clock;
+	clock::time_point start = clock::now();
+	clock::time_point last = clock::now();
+
+	void Phase(const char *name) {
+		if (!HashedSortTimingEnabled()) {
+			return;
+		}
+		const auto now = clock::now();
+		fprintf(stderr, "[hashed-sort build] %s: %.3f ms (total %.3f ms)\n", name,
+		        std::chrono::duration<double, std::milli>(now - last).count(),
+		        std::chrono::duration<double, std::milli>(now - start).count());
+		last = now;
+	}
+};
+
+static void FinishHashJoinBuild(HashJoinGlobalSinkState &sink);
+
+class HashedSortSortTask : public ExecutorTask {
+public:
+	HashedSortSortTask(shared_ptr<Event> event_p, HashJoinGlobalSinkState &sink_p, atomic<idx_t> &next_bucket_p)
+	    : ExecutorTask(sink_p.context, std::move(event_p), sink_p.op), sink(sink_p), next_bucket(next_bucket_p) {
+	}
+
+	TaskExecutionResult ExecuteTask(TaskExecutionMode mode) override {
+		JoinFinalizeCpuScope cpu_scope(sink.phase_times);
+		auto &ht = *sink.hash_table;
+		while (true) {
+			const auto bucket = next_bucket.fetch_add(1, std::memory_order_relaxed);
+			if (bucket >= ht.sorted_coarse_buckets) {
+				break;
+			}
+			ht.SortCoarseBucket(bucket);
+		}
+		event->FinishTask();
+		return TaskExecutionResult::TASK_FINISHED;
+	}
+
+	string TaskType() const override {
+		return "HashedSortSortTask";
+	}
+
+private:
+	HashJoinGlobalSinkState &sink;
+	atomic<idx_t> &next_bucket;
+};
+
+class HashedSortSortEvent : public BasePipelineEvent {
+public:
+	HashedSortSortEvent(Pipeline &pipeline_p, HashJoinGlobalSinkState &sink, shared_ptr<HashedSortTimer> timer_p)
+	    : BasePipelineEvent(pipeline_p), sink(sink), timer(std::move(timer_p)) {
+	}
+
+	void Schedule() override {
+		vector<shared_ptr<Task>> tasks;
+		for (idx_t i = 0; i < NumericCast<idx_t>(sink.num_threads); i++) {
+			tasks.push_back(make_uniq<HashedSortSortTask>(shared_from_this(), sink, next_bucket));
+		}
+		SetTasks(std::move(tasks));
+	}
+
+	void FinishEvent() override {
+		timer->Phase("sort buckets");
+		FinishHashJoinBuild(sink);
+	}
+
+private:
+	HashJoinGlobalSinkState &sink;
+	shared_ptr<HashedSortTimer> timer;
+	atomic<idx_t> next_bucket {0};
+};
+
+class HashedSortHistogramTask : public ExecutorTask {
+public:
+	HashedSortHistogramTask(shared_ptr<Event> event_p, HashJoinGlobalSinkState &sink_p, atomic<idx_t> &next_batch_p)
+	    : ExecutorTask(sink_p.context, std::move(event_p), sink_p.op), sink(sink_p), next_batch(next_batch_p) {
+	}
+
+	TaskExecutionResult ExecuteTask(TaskExecutionMode mode) override {
+		JoinFinalizeCpuScope cpu_scope(sink.phase_times);
+		auto &ht = *sink.hash_table;
+		const auto batch_count = ht.SortedBatchCount();
+		while (true) {
+			const auto batch = next_batch.fetch_add(1, std::memory_order_relaxed);
+			if (batch >= batch_count) {
+				break;
+			}
+			ht.ComputeSortedHistogram(batch);
+		}
+		event->FinishTask();
+		return TaskExecutionResult::TASK_FINISHED;
+	}
+
+	string TaskType() const override {
+		return "HashedSortHistogramTask";
+	}
+
+private:
+	HashJoinGlobalSinkState &sink;
+	atomic<idx_t> &next_batch;
+};
+
+class HashedSortScatterEvent;
+
+//! Key-order mode: histogram the batches once the key range is known, then scatter
+class HashedSortHistogramEvent : public BasePipelineEvent {
+public:
+	HashedSortHistogramEvent(Pipeline &pipeline_p, HashJoinGlobalSinkState &sink, shared_ptr<HashedSortTimer> timer_p)
+	    : BasePipelineEvent(pipeline_p), sink(sink), timer(std::move(timer_p)) {
+	}
+
+	void Schedule() override {
+		auto &ht = *sink.hash_table;
+		const auto task_count = MinValue<idx_t>(NumericCast<idx_t>(sink.num_threads), ht.SortedBatchCount());
+		vector<shared_ptr<Task>> tasks;
+		for (idx_t i = 0; i < task_count; i++) {
+			tasks.push_back(make_uniq<HashedSortHistogramTask>(shared_from_this(), sink, next_batch));
+		}
+		SetTasks(std::move(tasks));
+	}
+
+	void FinishEvent() override;
+
+private:
+	HashJoinGlobalSinkState &sink;
+	shared_ptr<HashedSortTimer> timer;
+	atomic<idx_t> next_batch {0};
+};
+
+class HashedSortScatterTask : public ExecutorTask {
+public:
+	HashedSortScatterTask(shared_ptr<Event> event_p, HashJoinGlobalSinkState &sink_p, atomic<idx_t> &next_batch_p)
+	    : ExecutorTask(sink_p.context, std::move(event_p), sink_p.op), sink(sink_p), next_batch(next_batch_p) {
+	}
+
+	TaskExecutionResult ExecuteTask(TaskExecutionMode mode) override {
+		JoinFinalizeCpuScope cpu_scope(sink.phase_times);
+		auto &ht = *sink.hash_table;
+		const auto batch_count = ht.SortedBatchCount();
+		while (true) {
+			const auto batch = next_batch.fetch_add(1, std::memory_order_relaxed);
+			if (batch >= batch_count) {
+				break;
+			}
+			ht.ScatterSortedBatch(batch);
+		}
+		event->FinishTask();
+		return TaskExecutionResult::TASK_FINISHED;
+	}
+
+	string TaskType() const override {
+		return "HashedSortScatterTask";
+	}
+
+private:
+	HashJoinGlobalSinkState &sink;
+	atomic<idx_t> &next_batch;
+};
+
+class HashedSortScatterEvent : public BasePipelineEvent {
+public:
+	HashedSortScatterEvent(Pipeline &pipeline_p, HashJoinGlobalSinkState &sink, shared_ptr<HashedSortTimer> timer_p)
+	    : BasePipelineEvent(pipeline_p), sink(sink), timer(std::move(timer_p)) {
+	}
+
+	void Schedule() override {
+		auto &ht = *sink.hash_table;
+		const auto task_count = MinValue<idx_t>(NumericCast<idx_t>(sink.num_threads), ht.SortedBatchCount());
+		vector<shared_ptr<Task>> tasks;
+		for (idx_t i = 0; i < task_count; i++) {
+			tasks.push_back(make_uniq<HashedSortScatterTask>(shared_from_this(), sink, next_batch));
+		}
+		SetTasks(std::move(tasks));
+	}
+
+	void FinishEvent() override {
+		timer->Phase("scatter");
+		auto sort_event = make_shared_ptr<HashedSortSortEvent>(*pipeline, sink, timer);
+		InsertEvent(std::move(sort_event));
+	}
+
+private:
+	HashJoinGlobalSinkState &sink;
+	shared_ptr<HashedSortTimer> timer;
+	atomic<idx_t> next_batch {0};
+};
+
+void HashedSortHistogramEvent::FinishEvent() {
+	timer->Phase("histogram");
+	sink.hash_table->PrepareSortedScatter();
+	timer->Phase("prepare scatter");
+	auto scatter_event = make_shared_ptr<HashedSortScatterEvent>(*pipeline, sink, timer);
+	InsertEvent(std::move(scatter_event));
+}
+
 class HashJoinFinalizeEvent : public BasePipelineEvent {
 public:
 	HashJoinFinalizeEvent(Pipeline &pipeline_p, HashJoinGlobalSinkState &sink)
@@ -1284,7 +1742,9 @@ public:
 	vector<shared_ptr<Task>> GetTasks() {
 		auto &ht = *sink.hash_table;
 		auto &data_collection = ht.GetDataCollection();
-		const bool parallel = !FinalizeSingleThreaded(sink, false) && ht.GetRadixBits() != 0;
+		const bool parallel =
+		    (ht.use_sorted_entries ? ht.Count() >= SORTED_PARALLEL_THRESHOLD : !FinalizeSingleThreaded(sink, false)) &&
+		    ht.GetRadixBits() != 0;
 		const auto partitions = RadixPartitioning::NumberOfPartitions(ht.GetRadixBits());
 		queue = make_uniq<JoinBuildQueue>(partitions);
 		if (!parallel) {
@@ -1327,7 +1787,27 @@ public:
 			lane->task_count = 1;
 		}
 		ExecuteHashJoinFinalizeTask(sink, {0, ht.GetDataCollection().ChunkCount()}, false, lane);
-		FinishTasks();
+		MergeLanes();
+		if (ht.use_sorted_entries) {
+			timer.Phase("collect");
+			if (ht.sorted_order_by_key) {
+				ht.FinishSortedKeyRange();
+				for (idx_t batch = 0; batch < ht.SortedBatchCount(); batch++) {
+					ht.ComputeSortedHistogram(batch);
+				}
+				timer.Phase("histogram");
+			}
+			ht.PrepareSortedScatter();
+			for (idx_t batch = 0; batch < ht.SortedBatchCount(); batch++) {
+				ht.ScatterSortedBatch(batch);
+			}
+			timer.Phase("scatter");
+			for (idx_t bucket = 0; bucket < ht.sorted_coarse_buckets; bucket++) {
+				ht.SortCoarseBucket(bucket);
+			}
+			timer.Phase("sort buckets");
+		}
+		FinishHashJoinBuild(sink);
 	}
 
 	void Schedule() override {
@@ -1335,32 +1815,37 @@ public:
 	}
 
 	void FinishEvent() override {
-		FinishTasks();
+		MergeLanes();
+		auto &ht = *sink.hash_table;
+		if (ht.use_sorted_entries) {
+			timer.Phase("collect");
+			if (ht.sorted_order_by_key) {
+				ht.FinishSortedKeyRange();
+				auto histogram_event =
+				    make_shared_ptr<HashedSortHistogramEvent>(*pipeline, sink, make_shared_ptr<HashedSortTimer>(timer));
+				InsertEvent(std::move(histogram_event));
+				return;
+			}
+			ht.PrepareSortedScatter();
+			timer.Phase("prepare scatter");
+			auto scatter_event =
+			    make_shared_ptr<HashedSortScatterEvent>(*pipeline, sink, make_shared_ptr<HashedSortTimer>(timer));
+			InsertEvent(std::move(scatter_event));
+			return;
+		}
+		FinishHashJoinBuild(sink);
 	}
 
 	static constexpr idx_t CHUNKS_PER_TASK = 64;
+	//! The sorted build is several passes, so it pays to parallelize well below the pointer-table threshold
+	static constexpr idx_t SORTED_PARALLEL_THRESHOLD = 65536;
 
 private:
-	void FinishTasks() {
+	void MergeLanes() {
 		for (auto &lane : prefix_range_lanes) {
 			sink.hash_table->MergePrefixRangeBuildState(*lane->state);
 		}
 		sink.hash_table->GetDataCollection().VerifyEverythingPinned();
-
-		// Both finalize paths finish writing the chains before reaching here,
-		// so dictionary emission is safe on either path
-		if (sink.hash_table->CanUseDictionaryEmission(sink.op, sink.external,
-		                                              sink.op.children[0].get().estimated_cardinality)) {
-			sink.hash_table->BuildDictionaryArrays(sink.op);
-		}
-
-		if (sink.global_filter_state) {
-			// a finalize-built bloom filter is complete once the tasks are done; a sink-built one is
-			// already sealed and this is a no-op
-			sink.hash_table->SealBloomFilter();
-			PublishDeferredRuntimeFilters(sink.context, *sink.hash_table, *sink.global_filter_state);
-		}
-		sink.hash_table->finalized = true;
 	}
 
 	void InitializePrefixRangeLanes(JoinHashTable &ht, idx_t task_count) {
@@ -1381,11 +1866,54 @@ private:
 
 	vector<unique_ptr<PrefixRangeBuildLane>> prefix_range_lanes;
 	unique_ptr<JoinBuildQueue> queue;
+	HashedSortTimer timer;
 };
+
+//! Final build steps shared by the pointer-table and hashed-sorting paths, after every build task has finished
+static void MarkJoinBuildDone(HashJoinGlobalSinkState &sink) {
+	if (!JoinPhaseTimingEnabled()) {
+		return;
+	}
+	sink.phase_times.finalize_end_ns = PhaseNowNs();
+	sink.phase_times.build_rows = sink.hash_table->Count();
+}
+
+static void FinishHashJoinBuild(HashJoinGlobalSinkState &sink) {
+	JoinFinalizeCpuScope cpu_scope(sink.phase_times);
+	auto &ht = *sink.hash_table;
+	// Both finalize paths finish writing the chains before reaching here,
+	// so dictionary emission is safe on either path
+	if (ht.CanUseDictionaryEmission(sink.op, sink.external, sink.op.children[0].get().estimated_cardinality)) {
+		ht.BuildDictionaryArrays(sink.op);
+	}
+
+	if (sink.global_filter_state) {
+		// a finalize-built bloom filter is complete once the tasks are done; a sink-built one is
+		// already sealed and this is a no-op
+		ht.SealBloomFilter();
+		PublishDeferredRuntimeFilters(sink.context, ht, *sink.global_filter_state);
+	}
+	ht.finalized = true;
+	MarkJoinBuildDone(sink);
+}
 
 void HashJoinGlobalSinkState::ScheduleFinalize(Pipeline &pipeline, Event &event) {
 	if (hash_table->Count() == 0) {
 		hash_table->finalized = true;
+		return;
+	}
+	if (!external && hash_table->CanUseSortedEntries()) {
+		hash_table->AllocateSortedEntries();
+		auto new_finalize_event = make_shared_ptr<HashJoinFinalizeEvent>(pipeline, *this);
+		// the sorted build is several passes, so it pays to parallelize well below the pointer-table threshold
+		const bool single_threaded =
+		    num_threads == 1 || (!ClientConfig::GetConfig(context).verify_parallelism &&
+		                         hash_table->Count() < HashJoinFinalizeEvent::SORTED_PARALLEL_THRESHOLD);
+		if (single_threaded) {
+			new_finalize_event->ExecuteDirectly();
+			return;
+		}
+		event.InsertEvent(std::move(new_finalize_event));
 		return;
 	}
 	hash_table->AllocatePointerTable(!external && !FinalizeSingleThreaded(*this, false));
@@ -2080,6 +2608,10 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
                                             OperatorSinkFinalizeInput &input) const {
 	auto &sink = input.global_state.Cast<HashJoinGlobalSinkState>();
 	auto &ht = *sink.hash_table;
+	if (JoinPhaseTimingEnabled()) {
+		AtomicMaxNs(sink.phase_times.finalize_start_ns, PhaseNowNs());
+	}
+	JoinFinalizeCpuScope cpu_scope(sink.phase_times);
 
 	// the filter covers the whole build side once Sink is done
 	ht.SealBloomFilter();
@@ -2193,6 +2725,11 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 	// In case of a large build side or duplicates, use regular hash join
 	if (!use_perfect_hash) {
 		sink.ScheduleFinalize(pipeline, event);
+	} else {
+		MarkJoinBuildDone(sink);
+	}
+	if (ht.Count() == 0) {
+		MarkJoinBuildDone(sink);
 	}
 	sink.finalized = true;
 	if (ht.Count() == 0 && EmptyResultIfRHSIsEmpty()) {
@@ -2336,6 +2873,12 @@ OperatorResultType PhysicalHashJoin::ExecuteInternal(ExecutionContext &context, 
 	auto &sink = sink_state->Cast<HashJoinGlobalSinkState>();
 	D_ASSERT(sink.finalized);
 	D_ASSERT(!sink.scanned_data);
+	unique_ptr<JoinPhaseScope> phase_scope;
+	if (JoinPhaseTimingEnabled()) {
+		auto &t = sink.phase_times;
+		phase_scope = make_uniq<JoinPhaseScope>(t, t.probe_cpu_ns, t.first_probe_ns, t.last_probe_ns);
+		t.probe_rows += input.size();
+	}
 
 	if (sink.hash_table->Count() == 0) {
 		if (sink.hash_table->HasUncorrelatedMarkJoin()) {
@@ -2379,6 +2922,10 @@ OperatorResultType PhysicalHashJoin::ExecuteInternal(ExecutionContext &context, 
 		// probe the HT, start by resolving the join keys for the left chunk
 		state.lhs_join_keys.Reset();
 		state.probe_executor.Execute(input, state.lhs_join_keys);
+		if (JoinOrderStatsEnabled() && conditions.size() == 1) {
+			AccumulateJoinOrderStats(state.lhs_join_keys.data[0], state.lhs_join_keys.size(),
+			                         sink.probe_order_stats);
+		}
 
 		// perform the actual probe
 		if (sink.external) {
@@ -2899,6 +3446,11 @@ SourceResultType PhysicalHashJoin::GetDataInternal(ExecutionContext &context, Da
 	auto &gstate = input.global_state.Cast<HashJoinGlobalSourceState>();
 	auto &lstate = input.local_state.Cast<HashJoinLocalSourceState>();
 	sink.scanned_data = true;
+	unique_ptr<JoinPhaseScope> phase_scope;
+	if (JoinPhaseTimingEnabled()) {
+		auto &t = sink.phase_times;
+		phase_scope = make_uniq<JoinPhaseScope>(t, t.probe_cpu_ns, t.first_probe_ns, t.last_probe_ns);
+	}
 
 	if (!sink.external && !PropagatesBuildSide(join_type)) {
 		annotated_lock_guard<annotated_mutex> guard(gstate.lock);

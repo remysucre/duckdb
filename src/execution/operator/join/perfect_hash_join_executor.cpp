@@ -1,5 +1,7 @@
 #include "duckdb/execution/operator/join/perfect_hash_join_executor.hpp"
 
+#include <cstdlib>
+
 #include "duckdb/common/operator/subtract.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
 #include "duckdb/common/atomic.hpp"
@@ -117,18 +119,42 @@ bool PerfectHashJoinExecutor::CanDoPerfectHashJoin(const PhysicalHashJoin &op, c
 		return false;
 	}
 
-	// The max size our build must have to run the perfect HJ
+	// The max size our build must have to run the perfect HJ (experiment: DUCKDB_PHJ_MAX_RANGE overrides)
 	static constexpr idx_t MAX_BUILD_SIZE = 1048576;
-	if (build_range > Hugeint::Convert(MAX_BUILD_SIZE)) {
+	idx_t max_build_size = MAX_BUILD_SIZE;
+	if (const auto env = std::getenv("DUCKDB_PHJ_MAX_RANGE")) {
+		max_build_size = NumericCast<idx_t>(std::atoll(env));
+	}
+	if (build_range > Hugeint::Convert(max_build_size)) {
 		return false;
 	}
 	perfect_join_statistics.build_range = NumericCast<idx_t>(build_range);
 
 	// If count is larger than range (duplicates), we bail out
 	if (ht.Count() > perfect_join_statistics.build_range) {
+		if (std::getenv("DUCKDB_PHJ_DEBUG")) {
+			fprintf(stderr, "[phj] duplicates: rows=%llu range=%llu\n", (unsigned long long)ht.Count(),
+			        (unsigned long long)perfect_join_statistics.build_range);
+		}
 		return false;
 	}
+	// experiment: DUCKDB_PHJ_MAX_SPARSITY caps range / rows so sparse builds do not allocate huge arrays
+	if (const auto env = std::getenv("DUCKDB_PHJ_MAX_SPARSITY")) {
+		const auto max_sparsity = NumericCast<idx_t>(std::atoll(env));
+		if (max_sparsity > 0 && perfect_join_statistics.build_range > MaxValue<idx_t>(ht.Count(), 1) * max_sparsity &&
+		    perfect_join_statistics.build_range > MAX_BUILD_SIZE) {
+			if (std::getenv("DUCKDB_PHJ_DEBUG")) {
+				fprintf(stderr, "[phj] too sparse: rows=%llu range=%llu\n", (unsigned long long)ht.Count(),
+				        (unsigned long long)perfect_join_statistics.build_range);
+			}
+			return false;
+		}
+	}
 
+	if (std::getenv("DUCKDB_PHJ_DEBUG")) {
+		fprintf(stderr, "[phj] fires: rows=%llu range=%llu\n", (unsigned long long)ht.Count(),
+		        (unsigned long long)perfect_join_statistics.build_range);
+	}
 	perfect_join_statistics.is_build_small = true;
 	return true;
 }

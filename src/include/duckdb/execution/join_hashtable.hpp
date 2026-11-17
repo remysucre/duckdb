@@ -174,6 +174,10 @@ public:
 		// Thread-local probe match count, flushed when the current chunk's pointer scan is exhausted.
 		idx_t local_probe_matches = 0;
 
+		//! Hashed-sorting mode: position in the sorted entry array and probe hash per probe row
+		unsafe_unique_array<idx_t> entry_positions;
+		unsafe_unique_array<hash_t> probe_hashes;
+
 		explicit ScanStructure(JoinHashTable &ht, TupleDataChunkState &key_state);
 		void Reset();
 		//! Get the next batch of data from the scan structure
@@ -198,6 +202,8 @@ public:
 		//! Scan the hashtable for matches of the specified keys, setting the found_match[] array to true or false
 		//! for every tuple
 		void ScanKeyMatches(DataChunk &keys, DataChunk &probe_data);
+		//! Mark every sorted entry with the same hash as the current match as found (right semi/anti joins)
+		void MarkSortedRunsAsFound(idx_t result_count);
 		template <bool MATCH>
 		void NextSemiOrAntiJoin(DataChunk &keys, DataChunk &left, DataChunk &result);
 		void ConstructMarkJoinResult(DataChunk &join_keys, DataChunk &child, DataChunk &result);
@@ -334,6 +340,103 @@ public:
 	//! Probe the HT with the given input chunk, resulting in the given result
 	void Probe(ScanStructure &scan_structure, DataChunk &keys, TupleDataChunkState &key_state, ProbeState &probe_state,
 	           optional_ptr<Vector> precomputed_hashes = nullptr);
+
+	//===--------------------------------------------------------------------===//
+	// Hashed-sorting build (experimental): sorted (hash, row) entries instead of a pointer table
+	//===--------------------------------------------------------------------===//
+	struct SortedEntry {
+		hash_t hash;
+		data_ptr_t row;
+	};
+	//! Entries collected by one finalize task, with a histogram over the coarse buckets
+	struct SortedEntryBatch {
+		unsafe_vector<SortedEntry> entries;
+		unsafe_vector<idx_t> histogram;
+		unsafe_vector<idx_t> write_offsets;
+		uint64_t min_key = NumericLimits<uint64_t>::Maximum();
+		uint64_t max_key = 0;
+	};
+	//! Maps an order key (hash, or the integer key itself in key-order mode) to its fine and coarse bucket
+	struct SortedBucketFn {
+		bool by_key = false;
+		uint64_t key_min = 0;
+		idx_t key_shift = 0;
+		idx_t hash_shift = 64;
+		idx_t fine_to_coarse = 0;
+		inline idx_t Fine(uint64_t okey) const {
+			return by_key ? (okey - key_min) >> key_shift : okey >> hash_shift;
+		}
+		inline idx_t Coarse(uint64_t okey) const {
+			return Fine(okey) >> fine_to_coarse;
+		}
+	};
+	//! Coarse buckets are the top sorted_coarse_bits of the hash, used for the parallel scatter and sort
+	idx_t sorted_coarse_bits = 12;
+	idx_t sorted_coarse_buckets = 1ULL << 12;
+	idx_t sorted_coarse_shift = 64 - 12;
+
+	//! Whether the hashed-sorting build can be used for this join (enabled, single integer key)
+	bool CanUseSortedEntries() const;
+	//! Allocate the sorted entry array and bucket offsets, and switch the HT into sorted mode
+	void AllocateSortedEntries();
+	//! Key-order mode: derive the key range from the batches and size the fine buckets (after all Finalize calls)
+	void FinishSortedKeyRange();
+	//! Key-order mode: histogram one batch over the coarse buckets (needs the key range)
+	void ComputeSortedHistogram(idx_t batch_idx);
+	//! Compute the scatter offsets of every batch (single-threaded, after all Finalize calls)
+	void PrepareSortedScatter();
+	//! Scatter one batch into the sorted entry array by coarse bucket
+	void ScatterSortedBatch(idx_t batch_idx);
+	//! Sort one coarse bucket and fill its fine bucket offsets
+	void SortCoarseBucket(idx_t bucket_idx);
+	//! Number of batches to scatter
+	idx_t SortedBatchCount() const {
+		return sorted_batches.size();
+	}
+
+	bool use_sorted_entries = false;
+	//! Row mode: the rows themselves are copied into hash order, instead of an index of (hash, row) entries
+	bool sorted_rows_mode = false;
+	//! Key-order mode: order by the integer key itself instead of its hash; buckets are (key - min) >> shift
+	bool sorted_order_by_key = false;
+	uint64_t sorted_key_min = 0;
+	uint64_t sorted_key_max = 0;
+	SortedBucketFn sorted_bucket_fn;
+	//! Row mode: permute each bucket in place by cycle following, instead of through a temporary buffer
+	bool sorted_permute_in_place = false;
+	//! Hashed-sorting probe knobs (read from the environment when the HT is allocated)
+	bool sorted_probe_sort_chunk = false;
+	bool sorted_probe_verify = false;
+	//! Sorted probe chunks: one lookup per run of equal keys
+	bool sorted_probe_run_collapse = true;
+	idx_t sorted_entry_count = 0;
+	idx_t sorted_bucket_bits = 0;
+	idx_t sorted_bucket_shift = 64;
+	HugeAllocation sorted_entries;
+	HugeAllocation sorted_rows;
+	HugeAllocation sorted_bucket_offsets;
+	unsafe_vector<idx_t> sorted_coarse_offsets;
+	mutex sorted_batches_lock;
+	vector<unique_ptr<SortedEntryBatch>> sorted_batches;
+
+	SortedEntry *GetSortedEntries() {
+		return reinterpret_cast<SortedEntry *>(sorted_entries.get());
+	}
+	uint32_t *GetSortedBucketOffsets() {
+		return reinterpret_cast<uint32_t *>(sorted_bucket_offsets.get());
+	}
+	inline hash_t SortedHashAt(idx_t pos) const {
+		if (sorted_rows_mode) {
+			return Load<hash_t>(sorted_rows.get() + pos * entry_size + pointer_offset);
+		}
+		return reinterpret_cast<const SortedEntry *>(sorted_entries.get())[pos].hash;
+	}
+	inline data_ptr_t SortedRowAt(idx_t pos) {
+		if (sorted_rows_mode) {
+			return sorted_rows.get() + pos * entry_size;
+		}
+		return GetSortedEntries()[pos].row;
+	}
 	//! Enable selective NULL refinement for an uncorrelated multi-column MARK join
 	void InitializeUncorrelatedMarkJoin();
 	bool HasUncorrelatedMarkJoin() const;
@@ -472,6 +575,8 @@ public:
 
 	//! True once BuildDictionaryArrays has embedded dictionary indices into NEXT_PTR
 	bool use_dict_emission = false;
+	//! Sorted row mode: the dictionary index is the row's position in the sorted row array
+	bool dict_index_from_position = false;
 	//! Pre-materialized columnar data, one entry per RHS output column
 	vector<buffer_ptr<DictionaryEntry>> dict_arrays;
 	//! Dict-surviving descriptor shared with every other per-thread JHT of the same join; set by
@@ -527,6 +632,13 @@ private:
 	void GetRowPointers(DataChunk &keys, TupleDataChunkState &key_state, ProbeState &state, Vector &hashes_v,
 	                    optional_ptr<const SelectionVector> sel, idx_t &count, Vector &pointers_result_v,
 	                    SelectionVector &match_sel, bool has_sel);
+	//! Sorted-entry variant of GetRowPointers: bucket lookup by the top hash bits, no key comparison
+	void GetRowPointersSorted(ScanStructure &scan_structure, Vector &hashes_v, Vector &key_v,
+	                          optional_ptr<const SelectionVector> sel, idx_t &count, bool has_sel);
+	//! Sorted-entry variant of Finalize: collect (hash, row) entries into a batch
+	void CollectSortedEntries(idx_t chunk_idx_from, idx_t chunk_idx_to,
+	                          optional_ptr<PrefixRangeFilter::BuildState> prefix_range_state,
+	                          bool prefix_range_parallel);
 
 private:
 	//! Insert the given set of locations into the HT with the given set of hashes_v

@@ -18,6 +18,9 @@
 #include "duckdb/common/atomic.hpp"
 #include "duckdb/planner/joinside.hpp"
 
+#include <algorithm>
+#include <cstdlib>
+
 namespace duckdb {
 
 using ValidityBytes = JoinHashTable::ValidityBytes;
@@ -375,6 +378,702 @@ static void GetRowPointersInternal(DataChunk &keys, TupleDataChunkState &key_sta
 inline bool JoinHashTable::UseSalt() const {
 	// only use salt for large hash tables
 	return this->capacity > USE_SALT_THRESHOLD;
+}
+
+//===--------------------------------------------------------------------===//
+// Hashed-sorting build
+//===--------------------------------------------------------------------===//
+static bool HashedSortEnvFlag(const char *name, bool default_value) {
+	const auto value = std::getenv(name);
+	if (!value || !*value) {
+		return default_value;
+	}
+	return value[0] != '0';
+}
+
+static idx_t HashedSortEnvIdxOnce(const char *name, idx_t default_value) {
+	const auto value = std::getenv(name);
+	if (!value || !*value) {
+		return default_value;
+	}
+	return NumericCast<idx_t>(std::atoll(value));
+}
+
+static int64_t HashedSortEnvInt(const char *name, int64_t default_value) {
+	const auto value = std::getenv(name);
+	if (!value || !*value) {
+		return default_value;
+	}
+	return std::atoll(value);
+}
+
+//! Monotone map from an integer key to an unsigned order key
+template <class T>
+static inline uint64_t OrderKeyOf(T value) {
+	if (std::is_signed<T>::value) {
+		return static_cast<uint64_t>(static_cast<int64_t>(value)) ^ (uint64_t(1) << 63);
+	}
+	return static_cast<uint64_t>(value);
+}
+
+template <class T>
+static inline uint64_t LoadOrderKey(const_data_ptr_t ptr) {
+	return OrderKeyOf<T>(Load<T>(ptr));
+}
+
+static uint64_t LoadOrderKey(const_data_ptr_t ptr, PhysicalType type) {
+	switch (type) {
+	case PhysicalType::INT8:
+		return LoadOrderKey<int8_t>(ptr);
+	case PhysicalType::INT16:
+		return LoadOrderKey<int16_t>(ptr);
+	case PhysicalType::INT32:
+		return LoadOrderKey<int32_t>(ptr);
+	case PhysicalType::INT64:
+		return LoadOrderKey<int64_t>(ptr);
+	case PhysicalType::UINT8:
+		return LoadOrderKey<uint8_t>(ptr);
+	case PhysicalType::UINT16:
+		return LoadOrderKey<uint16_t>(ptr);
+	case PhysicalType::UINT32:
+		return LoadOrderKey<uint32_t>(ptr);
+	case PhysicalType::UINT64:
+		return LoadOrderKey<uint64_t>(ptr);
+	default:
+		throw InternalException("LoadOrderKey: unsupported type");
+	}
+}
+
+template <class T>
+static void OrderKeysFromVector(Vector &key_v, const sel_t *rows_sel, idx_t count, uint64_t *out) {
+	auto values = key_v.Values<T>();
+	for (idx_t i = 0; i < count; i++) {
+		out[i] = OrderKeyOf<T>(values[rows_sel[i]].GetValue());
+	}
+}
+
+static void OrderKeysFromVector(Vector &key_v, const sel_t *rows_sel, idx_t count, uint64_t *out) {
+	switch (key_v.GetType().InternalType()) {
+	case PhysicalType::INT8:
+		return OrderKeysFromVector<int8_t>(key_v, rows_sel, count, out);
+	case PhysicalType::INT16:
+		return OrderKeysFromVector<int16_t>(key_v, rows_sel, count, out);
+	case PhysicalType::INT32:
+		return OrderKeysFromVector<int32_t>(key_v, rows_sel, count, out);
+	case PhysicalType::INT64:
+		return OrderKeysFromVector<int64_t>(key_v, rows_sel, count, out);
+	case PhysicalType::UINT8:
+		return OrderKeysFromVector<uint8_t>(key_v, rows_sel, count, out);
+	case PhysicalType::UINT16:
+		return OrderKeysFromVector<uint16_t>(key_v, rows_sel, count, out);
+	case PhysicalType::UINT32:
+		return OrderKeysFromVector<uint32_t>(key_v, rows_sel, count, out);
+	case PhysicalType::UINT64:
+		return OrderKeysFromVector<uint64_t>(key_v, rows_sel, count, out);
+	default:
+		throw InternalException("OrderKeysFromVector: unsupported type");
+	}
+}
+
+bool JoinHashTable::CanUseSortedEntries() const {
+#ifdef DUCKDB_HASH_ZERO
+	return false;
+#else
+	if (!HashedSortEnvFlag("DUCKDB_HASHED_SORT_JOIN", false)) {
+		return false;
+	}
+	// a single integer equality key: the integer hash is bijective, so equal hashes imply equal keys
+	if (conditions.size() != 1 || equality_types.size() != 1 ||
+	    conditions[0].GetComparisonType() != ExpressionType::COMPARE_EQUAL) {
+		return false;
+	}
+	switch (equality_types[0].InternalType()) {
+	case PhysicalType::INT8:
+	case PhysicalType::INT16:
+	case PhysicalType::INT32:
+	case PhysicalType::INT64:
+	case PhysicalType::UINT8:
+	case PhysicalType::UINT16:
+	case PhysicalType::UINT32:
+	case PhysicalType::UINT64:
+		break;
+	default:
+		return false;
+	}
+	if (Count() >= NumericLimits<uint32_t>::Maximum() - 1) {
+		return false;
+	}
+	// row mode copies rows, so the found flags of RIGHT/FULL joins would not be visible to the final HT scan
+	if (HashedSortEnvFlag("DUCKDB_HSJ_ROWS", false) && PropagatesBuildSide(join_type)) {
+		return false;
+	}
+	return true;
+#endif
+}
+
+void JoinHashTable::AllocateSortedEntries() {
+	D_ASSERT(CanUseSortedEntries());
+	use_sorted_entries = true;
+	sorted_probe_sort_chunk = HashedSortEnvFlag("DUCKDB_HSJ_SORT_PROBE", false);
+	sorted_probe_verify = HashedSortEnvFlag("DUCKDB_HSJ_VERIFY", false);
+	sorted_probe_run_collapse = HashedSortEnvFlag("DUCKDB_HSJ_RUN_COLLAPSE", true);
+	sorted_batches.clear();
+	sorted_entry_count = 0;
+
+	if (should_build_bloom_filter && (!bloom_filter || bloom_filter->IsSealed())) {
+		bloom_filter = recycled_bloom_filter ? std::move(recycled_bloom_filter) : make_shared_ptr<BloomFilter>();
+		bloom_filter->Initialize(context, MaxValue<idx_t>(Count(), 1));
+	}
+
+	const auto count = Count();
+	sorted_coarse_bits =
+	    NumericCast<idx_t>(MinValue<int64_t>(MaxValue<int64_t>(HashedSortEnvInt("DUCKDB_HSJ_COARSE_BITS", 12), 8), 16));
+	sorted_coarse_buckets = idx_t(1) << sorted_coarse_bits;
+	sorted_coarse_shift = 64 - sorted_coarse_bits;
+	// one fine bucket per entry on average, shifted by the knob (positive = fewer buckets)
+	const auto fine_shift = HashedSortEnvInt("DUCKDB_HSJ_FINE_SHIFT", 0);
+	const auto natural_bits =
+	    NumericCast<int64_t>(RadixPartitioning::RadixBitsOfPowerOfTwo(NextPowerOfTwo(MaxValue<idx_t>(count, 1))));
+	const auto fine_bits = MinValue<int64_t>(MaxValue<int64_t>(natural_bits - fine_shift, 0), 40);
+	sorted_bucket_bits = MaxValue<idx_t>(NumericCast<idx_t>(fine_bits), sorted_coarse_bits);
+	sorted_bucket_shift = 64 - sorted_bucket_bits;
+
+	auto &allocator = buffer_manager.GetBufferAllocator();
+	sorted_rows_mode = HashedSortEnvFlag("DUCKDB_HSJ_ROWS", false);
+	sorted_order_by_key = HashedSortEnvFlag("DUCKDB_HSJ_ORDER_BY_KEY", false);
+	sorted_permute_in_place = HashedSortEnvFlag("DUCKDB_HSJ_INPLACE", false);
+	if (sorted_rows_mode) {
+		sorted_rows = allocator.AllocateHuge(MaxValue<idx_t>(count, 1) * entry_size);
+	} else {
+		sorted_entries = allocator.AllocateHuge(MaxValue<idx_t>(count, 1) * sizeof(SortedEntry));
+	}
+	if (!sorted_order_by_key) {
+		// key-order mode sizes the fine buckets from the key range, once it is known
+		sorted_bucket_offsets = allocator.AllocateHuge(((1ULL << sorted_bucket_bits) + 1) * sizeof(uint32_t));
+	}
+	sorted_bucket_fn.by_key = sorted_order_by_key;
+	sorted_bucket_fn.hash_shift = sorted_bucket_shift;
+	sorted_bucket_fn.fine_to_coarse = sorted_bucket_bits - sorted_coarse_bits;
+	sorted_coarse_offsets.assign(sorted_coarse_buckets + 1, 0);
+
+	if (HashedSortEnvFlag("DUCKDB_HSJ_TIMING", false)) {
+		fprintf(stderr, "[hashed-sort build] rows=%llu row_width=%llu bucket_bits=%llu\n", (unsigned long long)count,
+		        (unsigned long long)entry_size, (unsigned long long)sorted_bucket_bits);
+	}
+	DUCKDB_LOG(context, PhysicalOperatorLogType, op, "JoinHashTable", "BuildSorted",
+	           {{"rows", to_string(count)}, {"bucket_bits", to_string(sorted_bucket_bits)}});
+}
+
+void JoinHashTable::CollectSortedEntries(idx_t chunk_idx_from, idx_t chunk_idx_to,
+                                         optional_ptr<PrefixRangeFilter::BuildState> prefix_range_state,
+                                         bool prefix_range_parallel) {
+	auto batch = make_uniq<SortedEntryBatch>();
+	batch->histogram.assign(sorted_coarse_buckets, 0);
+	auto &histogram = batch->histogram;
+	auto &entries = batch->entries;
+
+	const auto &layout = data_collection->GetLayout();
+	// propagating joins keep NULL-key rows in the collection; they never match, so they are not entries
+	const bool filter_nulls = PropagatesBuildSide(join_type) && !NullValuesAreEqual(0) && !layout.CannotHaveNull();
+	const auto column_count = layout.ColumnCount();
+	idx_t validity_entry_idx = 0;
+	idx_t validity_idx_in_entry = 0;
+	ValidityBytes::GetEntryIndex(0, validity_entry_idx, validity_idx_in_entry);
+
+	const bool by_key = sorted_order_by_key;
+	const auto key_offset = layout.GetOffsets()[0];
+	const auto key_type = equality_types[0].InternalType();
+	const auto bucket_fn = sorted_bucket_fn;
+	uint64_t min_key = NumericLimits<uint64_t>::Maximum();
+	uint64_t max_key = 0;
+
+	Vector hashes(LogicalType::HASH);
+	TupleDataChunkIterator iterator(*data_collection, TupleDataPinProperties::KEEP_EVERYTHING_PINNED, chunk_idx_from,
+	                                chunk_idx_to, false);
+	const auto row_locations = iterator.GetRowLocations();
+	do {
+		const auto count = iterator.GetCurrentChunkCount();
+		{
+			auto hash_data = FlatVector::Writer<hash_t>(hashes, count_t(count));
+			for (idx_t i = 0; i < count; i++) {
+				hash_data.WriteValue(Load<hash_t>(row_locations[i] + pointer_offset));
+			}
+		}
+		if (bloom_filter && !bloom_filter->IsSealed()) {
+			bloom_filter->InsertHashes(hashes);
+		}
+		const auto hash_data = FlatVector::GetData<hash_t>(hashes);
+		for (idx_t i = 0; i < count; i++) {
+			const auto row = row_locations[i];
+			if (filter_nulls &&
+			    !ValidityBytes::RowIsValid(ValidityBytes(row, column_count).GetValidityEntryUnsafe(validity_entry_idx),
+			                               validity_idx_in_entry)) {
+				continue;
+			}
+			if (by_key) {
+				const auto okey = LoadOrderKey(row + key_offset, key_type);
+				entries.push_back({okey, row});
+				min_key = MinValue(min_key, okey);
+				max_key = MaxValue(max_key, okey);
+				continue;
+			}
+			const auto hash = hash_data[i];
+			entries.push_back({hash, row});
+			histogram[bucket_fn.Coarse(hash)]++;
+		}
+		if (prefix_range_state) {
+			InsertPrefixRangeChunk(iterator.GetChunkState(), count, *prefix_range_state, prefix_range_parallel);
+		}
+	} while (iterator.Next());
+	batch->min_key = min_key;
+	batch->max_key = max_key;
+
+	lock_guard<mutex> guard(sorted_batches_lock);
+	sorted_batches.push_back(std::move(batch));
+}
+
+void JoinHashTable::FinishSortedKeyRange() {
+	D_ASSERT(sorted_order_by_key);
+	uint64_t min_key = NumericLimits<uint64_t>::Maximum();
+	uint64_t max_key = 0;
+	for (auto &batch : sorted_batches) {
+		if (batch->entries.empty()) {
+			continue;
+		}
+		min_key = MinValue(min_key, batch->min_key);
+		max_key = MaxValue(max_key, batch->max_key);
+	}
+	if (min_key > max_key) {
+		min_key = max_key = 0;
+	}
+	sorted_key_min = min_key;
+	sorted_key_max = max_key;
+	// bits needed for (key - min); fine buckets cover the range, or address it directly when it is small
+	const auto range = max_key - min_key;
+	idx_t range_bits = 0;
+	while (range_bits < 64 && (range >> range_bits) != 0) {
+		range_bits++;
+	}
+	const auto natural_bits = sorted_bucket_bits; // sized for one entry per bucket by AllocateSortedEntries
+	const auto fine_bits = MaxValue<idx_t>(MinValue<idx_t>(range_bits, natural_bits), sorted_coarse_bits);
+	sorted_bucket_bits = fine_bits;
+	sorted_bucket_shift = 64 - fine_bits;
+	sorted_bucket_fn.by_key = true;
+	sorted_bucket_fn.key_min = min_key;
+	sorted_bucket_fn.key_shift = range_bits > fine_bits ? range_bits - fine_bits : 0;
+	sorted_bucket_fn.fine_to_coarse = fine_bits - sorted_coarse_bits;
+	sorted_bucket_offsets =
+	    buffer_manager.GetBufferAllocator().AllocateHuge(((1ULL << fine_bits) + 1) * sizeof(uint32_t));
+	if (HashedSortEnvFlag("DUCKDB_HSJ_TIMING", false)) {
+		fprintf(stderr, "[hashed-sort build] key range bits=%llu fine_bits=%llu key_shift=%llu\n",
+		        (unsigned long long)range_bits, (unsigned long long)fine_bits,
+		        (unsigned long long)sorted_bucket_fn.key_shift);
+	}
+}
+
+void JoinHashTable::ComputeSortedHistogram(idx_t batch_idx) {
+	auto &batch = *sorted_batches[batch_idx];
+	batch.histogram.assign(sorted_coarse_buckets, 0);
+	const auto bucket_fn = sorted_bucket_fn;
+	for (const auto &entry : batch.entries) {
+		batch.histogram[bucket_fn.Coarse(entry.hash)]++;
+	}
+}
+
+void JoinHashTable::PrepareSortedScatter() {
+	// coarse bucket totals, then per-batch write offsets within each coarse bucket
+	auto &coarse = sorted_coarse_offsets;
+	coarse.assign(sorted_coarse_buckets + 1, 0);
+	for (auto &batch : sorted_batches) {
+		for (idx_t b = 0; b < sorted_coarse_buckets; b++) {
+			coarse[b + 1] += batch->histogram[b];
+		}
+	}
+	for (idx_t b = 0; b < sorted_coarse_buckets; b++) {
+		coarse[b + 1] += coarse[b];
+	}
+	sorted_entry_count = coarse[sorted_coarse_buckets];
+	unsafe_vector<idx_t> running(coarse.begin(), coarse.end() - 1);
+	for (auto &batch : sorted_batches) {
+		batch->write_offsets.assign(sorted_coarse_buckets, 0);
+		for (idx_t b = 0; b < sorted_coarse_buckets; b++) {
+			batch->write_offsets[b] = running[b];
+			running[b] += batch->histogram[b];
+		}
+	}
+}
+
+//! Row copy for widths up to 64 bytes with two overlapping fixed-size moves; wider rows fall back to memcpy
+static inline void CopyRow(data_ptr_t dst, const_data_ptr_t src, idx_t row_width) {
+	if (row_width <= 8) {
+		memcpy(dst, src, row_width);
+	} else if (row_width <= 16) {
+		uint64_t a, b;
+		memcpy(&a, src, 8);
+		memcpy(&b, src + row_width - 8, 8);
+		memcpy(dst, &a, 8);
+		memcpy(dst + row_width - 8, &b, 8);
+	} else if (row_width <= 32) {
+		data_t a[16], b[16];
+		memcpy(a, src, 16);
+		memcpy(b, src + row_width - 16, 16);
+		memcpy(dst, a, 16);
+		memcpy(dst + row_width - 16, b, 16);
+	} else if (row_width <= 64) {
+		data_t a[32], b[32];
+		memcpy(a, src, 32);
+		memcpy(b, src + row_width - 32, 32);
+		memcpy(dst, a, 32);
+		memcpy(dst + row_width - 32, b, 32);
+	} else {
+		memcpy(dst, src, row_width);
+	}
+}
+
+static void ScatterSortedRows(data_ptr_t rows, idx_t row_width, idx_t *write_offsets,
+                              const JoinHashTable::SortedBucketFn &bucket_fn, idx_t key_slot_offset,
+                              const unsafe_vector<JoinHashTable::SortedEntry> &entries) {
+	for (const auto &entry : entries) {
+		const auto dst = rows + write_offsets[bucket_fn.Coarse(entry.hash)]++ * row_width;
+		CopyRow(dst, entry.row, row_width);
+		if (key_slot_offset != DConstants::INVALID_INDEX) {
+			// key-order mode: the row's hash slot holds the order key the probe compares against
+			Store<uint64_t>(entry.hash, dst + key_slot_offset);
+		}
+	}
+}
+
+//! In-place cycle permutation: afterwards rows[i] holds the row that was at keys[i].row (a local index)
+static void PermuteRowsInPlace(data_ptr_t rows, idx_t row_width, JoinHashTable::SortedEntry *keys, idx_t count) {
+	static constexpr idx_t VISITED = idx_t(1) << 63;
+	data_t temp[256];
+	for (idx_t i = 0; i < count; i++) {
+		auto src = reinterpret_cast<idx_t>(keys[i].row);
+		if (src & VISITED) {
+			continue;
+		}
+		keys[i].row = reinterpret_cast<data_ptr_t>(src | VISITED);
+		if (src == i) {
+			continue;
+		}
+		CopyRow(temp, rows + i * row_width, row_width);
+		idx_t dst = i;
+		while (src != i) {
+			CopyRow(rows + dst * row_width, rows + src * row_width, row_width);
+			dst = src;
+			src = reinterpret_cast<idx_t>(keys[dst].row);
+			keys[dst].row = reinterpret_cast<data_ptr_t>(src | VISITED);
+		}
+		CopyRow(rows + dst * row_width, temp, row_width);
+	}
+}
+
+void JoinHashTable::ScatterSortedBatch(idx_t batch_idx) {
+	auto &batch = *sorted_batches[batch_idx];
+	auto write_offsets = batch.write_offsets.data();
+	if (sorted_rows_mode) {
+		ScatterSortedRows(sorted_rows.get(), entry_size, write_offsets, sorted_bucket_fn,
+		                  sorted_order_by_key ? pointer_offset : DConstants::INVALID_INDEX, batch.entries);
+	} else {
+		auto entries = GetSortedEntries();
+		const auto bucket_fn = sorted_bucket_fn;
+		for (const auto &entry : batch.entries) {
+			entries[write_offsets[bucket_fn.Coarse(entry.hash)]++] = entry;
+		}
+	}
+	// release the staging memory as soon as the batch is scattered
+	batch.entries.clear();
+	batch.entries.shrink_to_fit();
+}
+
+//! Diverting LSD radix sort of entries that share the top sorted_coarse_bits: enough 11-bit passes to leave runs
+//! of a few entries, then an insertion sort pass finishes the order
+static void RadixSortEntries(JoinHashTable::SortedEntry *entries, const idx_t count, const uint64_t base,
+                             const idx_t varying_bits) {
+	using SortedEntry = JoinHashTable::SortedEntry;
+	static constexpr idx_t PASS_BITS = 11;
+	static constexpr idx_t PASS_BUCKETS = 1ULL << PASS_BITS;
+	static constexpr idx_t INSERTION_SORT_THRESHOLD = 32;
+	// entries share everything above the low varying_bits of (key - base); each pass covers the next 11 bits
+	// from the top of that range, and a pass is worth it while runs exceed ~4 entries
+	// expected run length left for the insertion sort; the knob exists to measure the pass count trade-off
+	static const idx_t RUN_TARGET = HashedSortEnvIdxOnce("DUCKDB_HSJ_RUN_TARGET", INSERTION_SORT_THRESHOLD / 8);
+	idx_t passes = 0;
+	for (idx_t runs = count; runs > RUN_TARGET && passes < 5; runs >>= PASS_BITS) {
+		passes++;
+	}
+	passes = MinValue<idx_t>(passes, (varying_bits + PASS_BITS - 1) / PASS_BITS);
+	if (count > INSERTION_SORT_THRESHOLD && passes > 0) {
+		unsafe_vector<SortedEntry> temp(count);
+		SortedEntry *src = entries;
+		SortedEntry *dst = temp.data();
+		for (idx_t pass = 0; pass < passes; pass++) {
+			const idx_t hi = varying_bits - PASS_BITS * (passes - 1 - pass);
+			const idx_t lo = hi > PASS_BITS ? hi - PASS_BITS : 0;
+			const uint64_t mask = (uint64_t(1) << (hi - lo)) - 1;
+			idx_t counts[PASS_BUCKETS + 1];
+			memset(counts, 0, sizeof(counts));
+			for (idx_t i = 0; i < count; i++) {
+				counts[(((src[i].hash - base) >> lo) & mask) + 1]++;
+			}
+			for (idx_t b = 0; b < PASS_BUCKETS; b++) {
+				counts[b + 1] += counts[b];
+			}
+			for (idx_t i = 0; i < count; i++) {
+				dst[counts[((src[i].hash - base) >> lo) & mask]++] = src[i];
+			}
+			std::swap(src, dst);
+		}
+		if (src != entries) {
+			memcpy(entries, src, count * sizeof(SortedEntry));
+		}
+	}
+	for (idx_t i = 1; i < count; i++) {
+		const auto entry = entries[i];
+		idx_t j = i;
+		while (j > 0 && entries[j - 1].hash > entry.hash) {
+			entries[j] = entries[j - 1];
+			j--;
+		}
+		entries[j] = entry;
+	}
+}
+
+void JoinHashTable::SortCoarseBucket(idx_t bucket_idx) {
+	auto offsets = GetSortedBucketOffsets();
+	const auto start = sorted_coarse_offsets[bucket_idx];
+	const auto end = sorted_coarse_offsets[bucket_idx + 1];
+	const auto count = end - start;
+	const auto bucket_fn = sorted_bucket_fn;
+	// within a coarse bucket only the bits below the coarse bucket vary
+	const uint64_t sort_base = bucket_fn.by_key ? bucket_fn.key_min : 0;
+	const idx_t varying_bits = bucket_fn.by_key ? bucket_fn.key_shift + bucket_fn.fine_to_coarse : sorted_coarse_shift;
+	if (sorted_rows_mode) {
+		// sort (hash, local index) keys, then permute the rows in place by following cycles
+		const auto row_width = entry_size;
+		const auto rows = sorted_rows.get() + start * row_width;
+		unsafe_vector<SortedEntry> keys(count);
+		for (idx_t i = 0; i < count; i++) {
+			keys[i].hash = Load<hash_t>(rows + i * row_width + pointer_offset);
+			keys[i].row = reinterpret_cast<data_ptr_t>(i);
+		}
+		RadixSortEntries(keys.data(), count, sort_base, varying_bits);
+		if (row_width <= 256 && sorted_permute_in_place) {
+			PermuteRowsInPlace(rows, row_width, keys.data(), count);
+		} else {
+			unsafe_unique_array<data_t> temp = make_unsafe_uniq_array_uninitialized<data_t>(count * row_width);
+			for (idx_t i = 0; i < count; i++) {
+				CopyRow(temp.get() + i * row_width, rows + reinterpret_cast<idx_t>(keys[i].row) * row_width, row_width);
+			}
+			memcpy(rows, temp.get(), count * row_width);
+		}
+	} else {
+		RadixSortEntries(GetSortedEntries() + start, count, sort_base, varying_bits);
+	}
+
+	// fine bucket offsets: every fine bucket nested in this coarse bucket points at its first entry
+	const auto fine_per_coarse_bits = sorted_bucket_bits - sorted_coarse_bits;
+	idx_t fine = bucket_idx << fine_per_coarse_bits;
+	const idx_t fine_end = (bucket_idx + 1) << fine_per_coarse_bits;
+	bool duplicates = false;
+	hash_t previous_hash = 0;
+	for (idx_t i = start; i < end; i++) {
+		const auto hash = SortedHashAt(i);
+		const auto fine_bucket = bucket_fn.Fine(hash);
+		while (fine <= fine_bucket) {
+			offsets[fine++] = static_cast<uint32_t>(i);
+		}
+		duplicates |= i > start && previous_hash == hash;
+		previous_hash = hash;
+	}
+	while (fine < fine_end) {
+		offsets[fine++] = static_cast<uint32_t>(end);
+	}
+	if (bucket_idx + 1 == sorted_coarse_buckets) {
+		offsets[fine_end] = static_cast<uint32_t>(end);
+	}
+	if (duplicates && insert_duplicate_keys) {
+		chains_longer_than_one.store(true, std::memory_order_relaxed);
+	}
+}
+
+template <bool ROWS>
+static void GetRowPointersSortedInternal(JoinHashTable &ht, JoinHashTable::ScanStructure &scan_structure,
+                                         Vector &hashes_v, Vector &key_v, optional_ptr<const SelectionVector> sel,
+                                         idx_t &count, bool has_sel) {
+	const auto entries = ROWS ? nullptr : ht.GetSortedEntries();
+	const auto rows = ROWS ? ht.sorted_rows.get() : nullptr;
+	const auto row_width = ht.entry_size;
+	const auto hash_offset = ht.pointer_offset;
+	const auto offsets = ht.GetSortedBucketOffsets();
+	const auto bucket_fn = ht.sorted_bucket_fn;
+	const auto by_key = ht.sorted_order_by_key;
+	const auto key_min = ht.sorted_key_min;
+	const auto key_max = ht.sorted_key_max;
+	const auto sorted_probe_sort_chunk = ht.sorted_probe_sort_chunk;
+
+	const auto ptrs = FlatVector::GetDataMutable<data_ptr_t>(scan_structure.pointers);
+	const auto positions = scan_structure.entry_positions.get();
+	const auto probe_hashes = scan_structure.probe_hashes.get();
+	auto &match_sel = scan_structure.sel_vector;
+
+	sel_t rows_sel[STANDARD_VECTOR_SIZE];
+	hash_t hs[STANDARD_VECTOR_SIZE];
+	for (idx_t i = 0; i < count; i++) {
+		rows_sel[i] = static_cast<sel_t>(has_sel ? sel->get_index(i) : i);
+	}
+	if (by_key) {
+		OrderKeysFromVector(key_v, rows_sel, count, hs);
+		// keys outside the build range cannot match; park them in the empty last bucket
+		idx_t kept = 0;
+		for (idx_t i = 0; i < count; i++) {
+			if (hs[i] >= key_min && hs[i] <= key_max) {
+				rows_sel[kept] = rows_sel[i];
+				hs[kept] = hs[i];
+				kept++;
+			}
+		}
+		count = kept;
+	} else {
+		auto hashes_unified = hashes_v.Values<hash_t>();
+		for (idx_t i = 0; i < count; i++) {
+			hs[i] = hashes_unified[rows_sel[i]].GetValue();
+		}
+	}
+
+	if (sorted_probe_sort_chunk) {
+		// counting sort of the chunk by the top hash bits so the lookups sweep the entry array monotonically
+		static constexpr idx_t PROBE_SORT_BITS = 11;
+		static constexpr idx_t PROBE_SORT_SHIFT = 64 - PROBE_SORT_BITS;
+		uint16_t counts[(1 << PROBE_SORT_BITS) + 1];
+		memset(counts, 0, sizeof(counts));
+		for (idx_t i = 0; i < count; i++) {
+			counts[(hs[i] >> PROBE_SORT_SHIFT) + 1]++;
+		}
+		for (idx_t b = 0; b < (1 << PROBE_SORT_BITS); b++) {
+			counts[b + 1] += counts[b];
+		}
+		sel_t sorted_rows[STANDARD_VECTOR_SIZE];
+		hash_t sorted_hs[STANDARD_VECTOR_SIZE];
+		for (idx_t i = 0; i < count; i++) {
+			const auto pos = counts[hs[i] >> PROBE_SORT_SHIFT]++;
+			sorted_rows[pos] = rows_sel[i];
+			sorted_hs[pos] = hs[i];
+		}
+		memcpy(rows_sel, sorted_rows, count * sizeof(sel_t));
+		memcpy(hs, sorted_hs, count * sizeof(hash_t));
+	}
+
+	// sorted-chunk fast path: one lookup per run of equal keys, result copied to every row of the run
+	if (ht.sorted_probe_run_collapse && count > 1) {
+		bool sorted = true;
+		for (idx_t i = 1; i < count && sorted; i++) {
+			sorted = hs[i] >= hs[i - 1];
+		}
+		if (sorted) {
+			idx_t match_count = 0;
+			idx_t i = 0;
+			while (i < count) {
+				const auto hash = hs[i];
+				idx_t j = i + 1;
+				while (j < count && hs[j] == hash) {
+					j++;
+				}
+				const auto bucket = bucket_fn.Fine(hash);
+				idx_t pos = offsets[bucket];
+				const idx_t end = offsets[bucket + 1];
+				if (ROWS) {
+					auto row_ptr = rows + pos * row_width;
+					while (pos < end && Load<hash_t>(row_ptr + hash_offset) < hash) {
+						pos++;
+						row_ptr += row_width;
+					}
+					if (pos < end && Load<hash_t>(row_ptr + hash_offset) == hash) {
+						for (idx_t k = i; k < j; k++) {
+							const auto row = rows_sel[k];
+							ptrs[row] = row_ptr;
+							positions[row] = pos;
+							probe_hashes[row] = hash;
+							match_sel.set_index(match_count++, row);
+						}
+					}
+				} else {
+					while (pos < end && entries[pos].hash < hash) {
+						pos++;
+					}
+					if (pos < end && entries[pos].hash == hash) {
+						for (idx_t k = i; k < j; k++) {
+							const auto row = rows_sel[k];
+							ptrs[row] = entries[pos].row;
+							positions[row] = pos;
+							probe_hashes[row] = hash;
+							match_sel.set_index(match_count++, row);
+						}
+					}
+				}
+				i = j;
+			}
+			count = match_count;
+			return;
+		}
+	}
+
+	// pass 1: bucket ranges, prefetching the offsets ahead
+	uint32_t starts[STANDARD_VECTOR_SIZE];
+	uint32_t ends[STANDARD_VECTOR_SIZE];
+	for (idx_t i = 0; i < count; i++) {
+		PrefetchHashTableEntry(i, count, [&](idx_t next_idx) { return &offsets[bucket_fn.Fine(hs[next_idx])]; });
+		const auto bucket = bucket_fn.Fine(hs[i]);
+		starts[i] = offsets[bucket];
+		ends[i] = offsets[bucket + 1];
+	}
+
+	// pass 2: scan the bucket for the probe hash, prefetching the entries ahead
+	idx_t match_count = 0;
+	for (idx_t i = 0; i < count; i++) {
+		PrefetchHashTableEntry(i, count, [&](idx_t next_idx) {
+			return ROWS ? rows + starts[next_idx] * row_width + hash_offset
+			            : reinterpret_cast<data_ptr_t>(&entries[starts[next_idx]]);
+		});
+		const auto hash = hs[i];
+		idx_t pos = starts[i];
+		const idx_t end = ends[i];
+		if (ROWS) {
+			auto row_ptr = rows + pos * row_width;
+			while (pos < end && Load<hash_t>(row_ptr + hash_offset) < hash) {
+				pos++;
+				row_ptr += row_width;
+			}
+			if (pos < end && Load<hash_t>(row_ptr + hash_offset) == hash) {
+				const auto row = rows_sel[i];
+				ptrs[row] = row_ptr;
+				positions[row] = pos;
+				probe_hashes[row] = hash;
+				match_sel.set_index(match_count++, row);
+			}
+		} else {
+			while (pos < end && entries[pos].hash < hash) {
+				pos++;
+			}
+			if (pos < end && entries[pos].hash == hash) {
+				const auto row = rows_sel[i];
+				ptrs[row] = entries[pos].row;
+				positions[row] = pos;
+				probe_hashes[row] = hash;
+				match_sel.set_index(match_count++, row);
+			}
+		}
+	}
+	count = match_count;
+}
+
+void JoinHashTable::GetRowPointersSorted(ScanStructure &scan_structure, Vector &hashes_v, Vector &key_v,
+                                         optional_ptr<const SelectionVector> sel, idx_t &count, bool has_sel) {
+	if (sorted_rows_mode) {
+		GetRowPointersSortedInternal<true>(*this, scan_structure, hashes_v, key_v, sel, count, has_sel);
+	} else {
+		GetRowPointersSortedInternal<false>(*this, scan_structure, hashes_v, key_v, sel, count, has_sel);
+	}
 }
 
 void JoinHashTable::GetRowPointers(DataChunk &keys, TupleDataChunkState &key_state, ProbeState &state, Vector &hashes_v,
@@ -1123,6 +1822,10 @@ void JoinHashTable::InitializePointerTable(idx_t entry_idx_from, idx_t entry_idx
 void JoinHashTable::Finalize(idx_t chunk_idx_from, idx_t chunk_idx_to, bool parallel,
                              optional_ptr<PrefixRangeFilter::BuildState> prefix_range_state,
                              bool prefix_range_parallel) {
+	if (use_sorted_entries) {
+		CollectSortedEntries(chunk_idx_from, chunk_idx_to, prefix_range_state, prefix_range_parallel);
+		return;
+	}
 	// Pointer table should be allocated
 	D_ASSERT(hash_map.get());
 
@@ -1187,6 +1890,37 @@ static bool LHSChunkIsConstant(const Vector &lhs_key) {
 
 void JoinHashTable::Probe(ScanStructure &scan_structure, DataChunk &keys, TupleDataChunkState &key_state,
                           ProbeState &probe_state, optional_ptr<Vector> precomputed_hashes) {
+	if (use_sorted_entries) {
+		optional_ptr<const SelectionVector> current_sel;
+		InitializeScanStructure(scan_structure, keys, key_state, current_sel);
+		if (scan_structure.count == 0) {
+			return;
+		}
+		if (!scan_structure.entry_positions) {
+			scan_structure.entry_positions = make_unsafe_uniq_array_uninitialized<idx_t>(STANDARD_VECTOR_SIZE);
+			scan_structure.probe_hashes = make_unsafe_uniq_array_uninitialized<hash_t>(STANDARD_VECTOR_SIZE);
+		}
+		Vector hashes(LogicalType::HASH);
+		if (sorted_order_by_key) {
+			// the key itself is the order key: no hashing
+		} else if (precomputed_hashes) {
+			hashes.Reference(*precomputed_hashes);
+		} else {
+			Hash(keys, *current_sel, scan_structure.count, hashes);
+		}
+		GetRowPointersSorted(scan_structure, hashes, keys.data[0], current_sel, scan_structure.count,
+		                     scan_structure.has_null_value_filter);
+		if (sorted_probe_verify && scan_structure.count > 0) {
+			SelectionVector no_match_sel(STANDARD_VECTOR_SIZE);
+			idx_t no_match_count = 0;
+			row_matcher_build.Match(keys, key_state.vector_data, scan_structure.sel_vector, scan_structure.count,
+			                        scan_structure.pointers, &no_match_sel, no_match_count);
+			if (no_match_count > 0) {
+				throw InternalException("hashed-sorting join: hash match without key match");
+			}
+		}
+		return;
+	}
 	// dispatch into the compressed-vector fast paths when the operator gated them on. precomputed_hashes
 	// is incompatible: the caller hashed the full N-row chunk; the fast paths re-hash a sliced D-row chunk.
 	if (probe_state.dict_state && !precomputed_hashes) {
@@ -1435,6 +2169,10 @@ ScanStructure::ScanStructure(JoinHashTable &ht_p, TupleDataChunkState &key_state
       found_match(make_unsafe_uniq_array_uninitialized<bool>(STANDARD_VECTOR_SIZE)), ht(ht_p), finished(false),
       is_null(true), rhs_pointers(LogicalType::POINTER), lhs_sel_vector(STANDARD_VECTOR_SIZE), last_match_count(0),
       last_sel_vector(STANDARD_VECTOR_SIZE) {
+	if (ht.use_sorted_entries) {
+		entry_positions = make_unsafe_uniq_array_uninitialized<idx_t>(STANDARD_VECTOR_SIZE);
+		probe_hashes = make_unsafe_uniq_array_uninitialized<hash_t>(STANDARD_VECTOR_SIZE);
+	}
 	if (ht.residual_predicate) {
 		residual_executor = make_uniq<ExpressionExecutor>(ht.context);
 		residual_executor->AddExpression(*ht.residual_predicate);
@@ -1669,6 +2407,21 @@ static void AdvancePointersLoop(JoinHashTable &ht, Vector &pointers, SelectionVe
 void ScanStructure::AdvancePointers(const SelectionVector &sel, const idx_t sel_count) {
 	if (!ht.chains_longer_than_one.load(std::memory_order_relaxed)) {
 		this->count = 0;
+		return;
+	}
+	if (ht.use_sorted_entries) {
+		const auto entry_count = ht.sorted_entry_count;
+		auto ptrs = FlatVector::GetDataMutable<data_ptr_t>(pointers);
+		idx_t new_count = 0;
+		for (idx_t i = 0; i < sel_count; i++) {
+			const auto idx = sel.get_index(i);
+			const auto pos = ++entry_positions[idx];
+			if (pos < entry_count && ht.SortedHashAt(pos) == probe_hashes[idx]) {
+				ptrs[idx] = ht.SortedRowAt(pos);
+				sel_vector.set_index(new_count++, idx);
+			}
+		}
+		count = new_count;
 		return;
 	}
 	if (ht.use_dict_emission) {
@@ -1939,6 +2692,29 @@ static void MarkChainsAsFoundLoop(JoinHashTable &ht, data_ptr_t ptrs[], const Se
 	}
 }
 
+//! Sorted-entry variant of MarkChainsAsFoundLoop: mark the run of equal-hash entries, then park the position at
+//! the end of the run so AdvancePointers drops the row
+void ScanStructure::MarkSortedRunsAsFound(const idx_t result_count) {
+	const auto entry_count = ht.sorted_entry_count;
+	for (idx_t i = 0; i < result_count; i++) {
+		const auto idx = chain_match_sel_vector.get_index(i);
+		auto pos = entry_positions[idx];
+		const auto hash = probe_hashes[idx];
+		if (Load<bool>(ht.SortedRowAt(pos) + ht.tuple_size)) {
+			entry_positions[idx] = entry_count;
+			continue;
+		}
+		while (true) {
+			Store<bool>(true, ht.SortedRowAt(pos) + ht.tuple_size);
+			if (pos + 1 >= entry_count || ht.SortedHashAt(pos + 1) != hash) {
+				break;
+			}
+			pos++;
+		}
+		entry_positions[idx] = pos;
+	}
+}
+
 void ScanStructure::NextRightSemiOrAntiJoin(DataChunk &keys, DataChunk &probe_data) {
 	const auto ptrs = FlatVector::GetDataMutable<data_ptr_t>(pointers);
 	while (!PointersExhausted()) {
@@ -1948,7 +2724,9 @@ void ScanStructure::NextRightSemiOrAntiJoin(DataChunk &keys, DataChunk &probe_da
 		if (ht.non_equality_predicates.empty() && !ht.residual_predicate) {
 			// we only have equality predicates - the match is found for the entire chain
 			const auto dead_end_ptr = ht.dead_end.get();
-			if (ht.use_dict_emission) {
+			if (ht.use_sorted_entries) {
+				MarkSortedRunsAsFound(result_count);
+			} else if (ht.use_dict_emission) {
 				MarkChainsAsFoundLoop<true>(ht, ptrs, chain_match_sel_vector, result_count, dead_end_ptr);
 			} else {
 				MarkChainsAsFoundLoop<false>(ht, ptrs, chain_match_sel_vector, result_count, dead_end_ptr);
@@ -2589,6 +3367,15 @@ void JoinHashTable::ResetForNewIterationSinglePartition() {
 	capacity = DConstants::INVALID_INDEX;
 	bitmask = DConstants::INVALID_INDEX;
 	bucket_shift = 0;
+	use_sorted_entries = false;
+	sorted_entry_count = 0;
+	sorted_entries.Reset();
+	sorted_rows.Reset();
+	sorted_bucket_offsets.Reset();
+	sorted_coarse_offsets.clear();
+	sorted_batches.clear();
+	sorted_order_by_key = false;
+	sorted_bucket_fn = SortedBucketFn();
 	finalized = false;
 	has_null = false;
 	chains_longer_than_one.store(false, std::memory_order_relaxed);
@@ -2605,6 +3392,7 @@ void JoinHashTable::ResetForNewIterationSinglePartition() {
 	aux_next_ptrs.Reset();
 	aux_next_ptrs_data = nullptr;
 	use_dict_emission = false;
+	dict_index_from_position = false;
 }
 
 bool JoinHashTable::PrepareExternalFinalize(const idx_t max_ht_size) {
@@ -2843,9 +3631,19 @@ void JoinHashTable::EmitDictVectors(const data_ptr_t *row_ptrs, const SelectionV
                                     DataChunk &result, idx_t rhs_col_offset) const {
 	D_ASSERT(output_columns.size() == dict_arrays.size());
 	SelectionVector build_sel_vec(count);
-	for (idx_t i = 0; i < count; i++) {
-		const auto idx = ptr_sel.get_index(i);
-		build_sel_vec.set_index(i, Load<uint32_t>(row_ptrs[idx] + pointer_offset));
+	if (dict_index_from_position) {
+		// sorted row mode: the dictionary is in sorted order, so the index is the row's position
+		const auto base = sorted_rows.get();
+		const auto row_width = entry_size;
+		for (idx_t i = 0; i < count; i++) {
+			const auto idx = ptr_sel.get_index(i);
+			build_sel_vec.set_index(i, NumericCast<sel_t>((row_ptrs[idx] - base) / row_width));
+		}
+	} else {
+		for (idx_t i = 0; i < count; i++) {
+			const auto idx = ptr_sel.get_index(i);
+			build_sel_vec.set_index(i, Load<uint32_t>(row_ptrs[idx] + pointer_offset));
+		}
 	}
 	for (idx_t col_idx = 0; col_idx < output_columns.size(); col_idx++) {
 		auto &vector = result.data[rhs_col_offset + col_idx];
@@ -2864,10 +3662,20 @@ void JoinHashTable::BuildDictionaryArrays(const PhysicalHashJoin &op) {
 	// collect a row pointer per build row; the TDC holds its own BufferHandles for its lifetime,
 	// and FinishEvent has already verified everything is pinned before calling us
 	Vector row_pointer_vector(LogicalType::POINTER, build_count);
-	JoinHTScanState scan_state(collection, 0, collection.ChunkCount(), TupleDataPinProperties::KEEP_EVERYTHING_PINNED);
-	const auto collected = FillWithHTOffsets(scan_state, row_pointer_vector);
-	D_ASSERT(collected == build_count);
-	(void)collected;
+	if (use_sorted_entries) {
+		// dictionary in sorted order, so a sorted position doubles as the dictionary index
+		D_ASSERT(sorted_entry_count == build_count);
+		auto writer = FlatVector::Writer<data_ptr_t>(row_pointer_vector, count_t(build_count));
+		for (idx_t i = 0; i < build_count; i++) {
+			writer.WriteValue(SortedRowAt(i));
+		}
+	} else {
+		JoinHTScanState scan_state(collection, 0, collection.ChunkCount(),
+		                           TupleDataPinProperties::KEEP_EVERYTHING_PINNED);
+		const auto collected = FillWithHTOffsets(scan_state, row_pointer_vector);
+		D_ASSERT(collected == build_count);
+		(void)collected;
+	}
 	const auto row_ptrs = FlatVector::GetData<data_ptr_t>(row_pointer_vector);
 
 	// LEFT / OUTER joins fill unmatched probe rows with a constant-NULL vector (NextLeftJoin), so they do not
@@ -2883,6 +3691,20 @@ void JoinHashTable::BuildDictionaryArrays(const PhysicalHashJoin &op) {
 		const auto output_col_idx = output_columns[col_idx];
 		collection.Gather(row_pointer_vector, sel, build_count, output_col_idx, dict_entry->data, sel, nullptr);
 		dict_arrays.emplace_back(std::move(dict_entry));
+	}
+
+	if (use_sorted_entries) {
+		// sorted mode never follows chain pointers; row mode keeps the hash in the row and derives the index
+		// from the position, index mode compares hashes from the entries and can reuse the row's hash slot
+		if (sorted_rows_mode) {
+			dict_index_from_position = true;
+		} else {
+			for (idx_t i = 0; i < build_count; i++) {
+				Store<uint32_t>(static_cast<uint32_t>(i), row_ptrs[i] + pointer_offset);
+			}
+		}
+		use_dict_emission = true;
+		return;
 	}
 
 	// save chain pointers before overwriting NEXT_PTR; GetNextPointer reads them back.
